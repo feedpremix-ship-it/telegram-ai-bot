@@ -1,0 +1,18 @@
+# Reference ONLY. Update the EXISTING Render service manually; do not create a Blueprint service.
+services:
+  - type: web
+    name: telegram-ai-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: GROQ_API_KEYS
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false

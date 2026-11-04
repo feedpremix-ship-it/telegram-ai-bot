@@ -1,164 +1,356 @@
-"""Telegram-бот с ИИ на Groq. Максимально простой и надежный."""
+"""Render Free Telegram assistant. Start: python bot.py. Secrets only in Environment."""
 import asyncio
-import html
+import contextlib
+import hmac
+import io
 import logging
-import os
-import re
-import time
-from datetime import datetime
+import signal
 
+import httpx
+from aiohttp import web
 from dotenv import load_dotenv
-from telegram import Update, LinkPreviewOptions
-from telegram.constants import ParseMode, ChatAction
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup, LinkPreviewOptions, ReplyKeyboardMarkup, Update
+from telegram.constants import ChatAction, ParseMode
+from telegram.error import TelegramError
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
-load_dotenv()
-logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)
+from assistant.config import Config
+from assistant.llm import LLM, UserError
+from assistant.output import clean_links, links_allowed, messages
+from assistant.store import Store
+from assistant.tools import Tools
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-GROQ_API_KEYS = [k.strip() for k in os.getenv("GROQ_API_KEYS", "").split(",") if k.strip()]
-GROQ_MODELS = [m.strip() for m in os.getenv("GROQ_MODELS", "deepseek-r1-distill-llama-70b,llama-3.3-70b-versatile").split(",") if m.strip()]
-ALLOWED_USER_IDS = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x}
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
-PORT = int(os.getenv("PORT", "10000"))
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
+LOG = logging.getLogger('assistant')
+MENU = ReplyKeyboardMarkup([
+    ['💬 Новый диалог', '🧠 Память'], ['🧹 Очистить историю', '📊 Возможности'], ['⚙️ Настройки', '❓ Помощь']
+], resize_keyboard=True)
+HELP = ('Я помогу с вопросами, текстами, переводами, программированием и математикой. '
+        'Короткий вопрос — короткий ответ, сложная задача — подробное объяснение.\n\n'
+        'Примеры: «Переведи на английский: хорошая погода», «Построй y=sin(x) от -10 до 10», '
+        '«Найди свежие новости науки» (если настроен поиск).\n'
+        '/weather Москва, Россия — текущая погода; /translate текст — перевод; /search запрос — поиск.\n'
+        '/new — новый диалог; /clear — удалить историю; /memory — память; /settings — длина ответа.\n\n'
+        'Не присылайте пароли и секреты. Текст запроса передаётся Groq, поисковые запросы — Tavily, '
+        'город — Open-Meteo. История хранится во внешней базе, если память включена. '
+        'Последний запрос сохраняется для повтора даже при выключенной памяти; /clear удаляет и его. '
+        'Ссылки показываю только по прямой просьбе; их доступность автоматически не проверяется. '
+        'Нейросетевой генерации изображений нет. Бесплатный сервис может засыпать и отвечать с задержкой.')
+RETRY = InlineKeyboardMarkup([[Button('🔄 Повторить', callback_data='retry')]])
 
-STYLE = """
-КАК ОТВЕЧАТЬ:
-- Общайся как живой, добрый и остроумный друг. Никакого канцелярита.
-- Лёгкий юмор уместен, если тема не серьёзная.
-- Длина: 4–8 коротких строк, не больше 700 символов.
-- Сначала прямой ответ, потом 2-4 пункта.
-- Оформление: заголовок с эмодзи (**жирным**), пункты с эмодзи-иконками. Без таблиц.
-"""
-SYSTEM_PROMPT = "Ты — универсальный помощник в Telegram. " + STYLE
 
-MODEL_INDEX = 0
-KEY_INDEX = 0
+def bounded_history(history, limit):
+    history = list(history[-30:])
+    while history and (history[0].get('role') != 'user' or sum(len(x['content']) for x in history) > limit):
+        history.pop(0)
+    return history
 
-async def ask_ai(history, system=SYSTEM_PROMPT):
-    global MODEL_INDEX, KEY_INDEX
-    import httpx
-    if not GROQ_API_KEYS or not GROQ_MODELS:
-        return "❌ Ошибка: не настроены ключи или модели Groq."
-    
-    # Пробуем модели по кругу
-    for _ in range(len(GROQ_MODELS) * len(GROQ_API_KEYS)):
-        model = GROQ_MODELS[MODEL_INDEX % len(GROQ_MODELS)]
-        key = GROQ_API_KEYS[KEY_INDEX % len(GROQ_API_KEYS)]
+
+class Service:
+    def __init__(self, cfg, store, llm, tools):
+        self.cfg, self.store, self.llm, self.tools = cfg, store, llm, tools
+        self.ready = False
+
+    def authorized(self, update):
+        return (update.effective_user is not None and update.effective_chat is not None
+                and update.effective_chat.type == 'private'
+                and update.effective_chat.id == update.effective_user.id
+                and (not self.cfg.allowed or update.effective_user.id in self.cfg.allowed))
+
+    async def send(self, msg, text, allow_links=False, keyboard=None):
+        for chunk in messages(text, allow_links):
+            await msg.reply_text(chunk, parse_mode=ParseMode.HTML,
+                                 link_preview_options=LinkPreviewOptions(is_disabled=True), reply_markup=keyboard)
+
+    async def menu(self, update, context=None, action=None):
+        if not self.authorized(update):
+            return
+        msg, uid = update.effective_message, update.effective_user.id
+        action = action or msg.text.split()[0].split('@')[0]
+        if action in ('/new', '/clear', '💬 Новый диалог', '🧹 Очистить историю'):
+            await self.store.set_user(uid, history=[], last_request='', last_answer='', retry_ready=False)
+            await self.send(msg, 'История и сохранённый запрос удалены. Начнём новый диалог.', keyboard=MENU)
+        elif action in ('/memory', '🧠 Память'):
+            user = await self.store.user(uid)
+            keyboard = InlineKeyboardMarkup([[Button('Выключить и удалить историю' if user['memory'] else 'Включить память', callback_data='memory')]])
+            await self.send(msg, f"Память {'включена' if user['memory'] else 'выключена'}. Сообщений в контексте: {len(user['history'])}.\n"
+                            'Память хранится в PostgreSQL. Последний запрос для повтора удаляется через /clear.', keyboard=keyboard)
+        elif action in ('/settings', '⚙️ Настройки'):
+            await self.send(msg, 'Выберите длину ответа:', keyboard=InlineKeyboardMarkup([
+                [Button('Авто', callback_data='detail:auto'), Button('Кратко', callback_data='detail:short'), Button('Подробно', callback_data='detail:long')]]))
+        elif action in ('/stats',):
+            if uid not in self.cfg.admins:
+                await self.send(msg, 'Статистика доступна администратору.')
+                return
+            row = await self.store.stats()
+            await self.send(msg, f"Сегодня UTC: API-попыток {row.get('attempts',0)}, успешных {row.get('successes',0)}, "
+                            f"ошибок {row.get('errors',0)}, учтённых токенов {row.get('tokens',0)}. "
+                            f"Незавершённых/неопределённых {row.get('attempts',0)-row.get('successes',0)-row.get('errors',0)}. "
+                            f"Консервативно зарезервировано {row.get('reserved',0)} токенов. "
+                            'Незавершённые попытки также занимают резерв. Данные не заменяют биллинг провайдера.')
+        elif action == '📊 Возможности':
+            await self.send(msg, '💬 Вопросы и тексты\n🧠 Память отдельных личных диалогов\n🌐 Перевод\n'
+                            '🌤 Текущая погода по уточнённому городу\n🔎 Поиск при наличии Tavily\n'
+                            '📈 Графики функций, столбчатые и круговые диаграммы\n'
+                            'Результаты ИИ могут содержать ошибки; проверяйте важные сведения.', keyboard=MENU)
+        else:
+            await self.send(msg, HELP, keyboard=MENU)
+
+    async def callback(self, update, context):
+        if not self.authorized(update):
+            if update.callback_query:
+                await update.callback_query.answer('Доступен только ваш личный диалог.', show_alert=True)
+            return
+        query, uid = update.callback_query, update.effective_user.id
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {key}"},
-                    json={
-                        "model": model,
-                        "temperature": 0.4,
-                        "messages": [{"role": "system", "content": system}] + history
-                    }
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    text = data["choices"][0]["message"]["content"]
-                    text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.S | re.I).strip()
-                    return text
-                elif resp.status_code == 429:
-                    MODEL_INDEX += 1
-                    time.sleep(1)
-                else:
-                    logging.warning(f"Groq {model} error {resp.status_code}: {resp.text[:100]}")
-                    MODEL_INDEX += 1
-        except Exception as e:
-            logging.warning(f"Groq connection error: {e}")
-            MODEL_INDEX += 1
-    return "😔 Все модели ИИ сейчас недоступны. Попробуйте позже."
+            await query.answer()
+        except TelegramError:
+            pass  # cold-start callbacks can outlive Telegram's answer window
+        if query.data == 'memory':
+            user = await self.store.user(uid)
+            await self.store.set_user(uid, memory=not user['memory'], history=[], last_request='', last_answer='', retry_ready=False)
+            await self.menu(update, action='/memory')
+        elif query.data in ('detail:auto','detail:short','detail:long'):
+            await self.store.set_user(uid, detail=query.data.split(':')[1])
+            await self.send(update.effective_message, 'Настройка сохранена.')
+        elif query.data == 'retry':
+            user = await self.store.user(uid)
+            if not user['retry_ready'] or not user['last_request']:
+                await self.send(update.effective_message, 'Нет запроса для повтора или он уже обрабатывается.')
+                return
+            await self.chat(update, user['last_request'], retry=True)
+        else:
+            await self.send(update.effective_message, 'Эта кнопка больше не поддерживается.')
 
-async def search_web(query):
-    if not TAVILY_API_KEY:
-        return ""
-    import httpx
+    async def on_message(self, update, context):
+        if not self.authorized(update):
+            return
+        text = (update.effective_message.text or '').strip()
+        if text in {v for row in MENU.keyboard for v in [x.text for x in row]}:
+            await self.menu(update, action=text)
+            return
+        await self.chat(update, text)
+
+    async def tool_command(self, update, context):
+        if not self.authorized(update):
+            return
+        command, _, text = update.effective_message.text.partition(' ')
+        if not text.strip():
+            await self.send(update.effective_message, 'После команды напишите город, текст для перевода или поисковый запрос.')
+            return
+        prefixes = {'/weather':'Узнай текущую погоду для города: ', '/translate':'Переведи следующий текст (если язык не указан: русский на английский, другой на русский): ', '/search':'Выполни поиск в интернете по запросу: '}
+        await self.chat(update, prefixes[command.split('@')[0]] + text)
+
+    async def typing(self, msg):
+        while True:
+            with contextlib.suppress(TelegramError):
+                await msg.chat.send_action(ChatAction.TYPING)
+            await asyncio.sleep(4)
+
+    async def chat(self, update, text, retry=False):
+        if not text or len(text) > 6000:
+            await self.send(update.effective_message, 'Отправьте текст длиной от 1 до 6000 символов.')
+            return
+        uid, msg = update.effective_user.id, update.effective_message
+        if not await self.store.admit(uid):
+            await self.send(msg, 'Слишком много запросов: подождите несколько секунд или до обновления дневного лимита.')
+            return
+        user = await self.store.user(uid)
+        if retry and user['last_answer']:
+            # Delivery retry reuses saved output; no second paid/token-consuming LLM request.
+            try:
+                await self.send(msg, user['last_answer'], links_allowed(text))
+                await self.store.set_user(uid, retry_ready=False)
+            except TelegramError:
+                await self.store.set_user(uid, retry_ready=True)
+            return
+        await self.store.set_user(uid, last_request=text, last_answer='', retry_ready=False)
+        typing = asyncio.create_task(self.typing(msg))
+        try:
+            history = bounded_history(user['history'], self.cfg.context_chars) if user['memory'] else []
+            answer, pictures = await self.llm.answer(history, text, user['detail'], self.tools.run, links_allowed(text))
+            answer = clean_links(answer, links_allowed(text))
+            new_history = bounded_history(history + [{'role':'user','content':text}, {'role':'assistant','content':answer}], self.cfg.context_chars)
+            await self.store.set_user(uid, history=new_history if user['memory'] else [], last_answer=answer)
+            for picture in pictures:
+                with io.BytesIO(picture) as image:
+                    image.name = 'chart.png'
+                    await msg.reply_photo(image, caption='График построен по заданным данным.')
+            await self.send(msg, answer, links_allowed(text))
+        except UserError as exc:
+            await self.store.set_user(uid, retry_ready=True)
+            await self.send(msg, str(exc), keyboard=RETRY)
+        except TelegramError:
+            await self.store.set_user(uid, retry_ready=True)
+            with contextlib.suppress(TelegramError):
+                await self.send(msg, 'Не удалось полностью доставить ответ. Повтор использует сохранённый текст; график нужно запросить заново.', keyboard=RETRY)
+        except Exception:
+            LOG.error('request_failed user_id=%s; diagnostic values suppressed', uid)
+            await self.store.set_user(uid, retry_ready=True)
+            await self.send(msg, 'Не удалось обработать запрос. Повторите позже.', keyboard=RETRY)
+        finally:
+            typing.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await typing
+
+    async def error(self, update, context):
+        LOG.error('update_failed type=%s; details suppressed', type(context.error).__name__)
+        if isinstance(update, Update) and self.authorized(update):
+            with contextlib.suppress(TelegramError):
+                await self.send(update.effective_message, 'Временная ошибка. Попробуйте позже.')
+
+    async def worker(self, app):
+        while True:
+            item = None
+            try:
+                if self.store.leader.is_closed():
+                    self.ready = False
+                    await asyncio.sleep(1)
+                    continue
+                item = await self.store.claim()
+                if not item:
+                    await asyncio.sleep(.25)
+                    continue
+                update_id, data = item
+                await app.process_update(Update.de_json(data, app.bot))
+                await self.store.finish(update_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.error('worker_failed; details suppressed')
+                if item:
+                    # Do not lose the terminal transition during a transient DB outage.
+                    while True:
+                        try:
+                            await self.store.finish(item[0], 'failed')
+                            break
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            await asyncio.sleep(1)
+                await asyncio.sleep(1)
+
+
+def make_application(cfg, service):
+    app = Application.builder().token(cfg.token).concurrent_updates(False).build()
+    app.add_handler(CommandHandler(['start','help','new','clear','memory','settings','stats'], service.menu))
+    app.add_handler(CommandHandler(['weather','translate','search'], service.tool_command))
+    app.add_handler(CallbackQueryHandler(service.callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, service.on_message))
+    app.add_error_handler(service.error)
+    return app
+
+
+def make_web_app(service):
+    server = web.Application(client_max_size=128*1024)
+    async def health(request):
+        try:
+            if not service.ready or service.store.leader.is_closed():
+                raise RuntimeError('not ready')
+            await service.store.pool.fetchval('SELECT 1')
+            return web.json_response({'status':'ok'})
+        except Exception:
+            return web.json_response({'status':'unavailable'}, status=503)
+    async def webhook(request):
+        token = request.headers.get('X-Telegram-Bot-Api-Secret-Token', '')
+        if not service.cfg.webhook_secret or not hmac.compare_digest(token.encode(), service.cfg.webhook_secret.encode()):
+            return web.Response(status=403)
+        if not service.ready:
+            return web.Response(status=503)
+        try:
+            data = await request.json()
+            if not isinstance(data, dict) or type(data.get('update_id')) is not int:
+                return web.Response(status=400)
+            accepted = await service.store.enqueue(data)
+        except (ValueError, TypeError, AttributeError):
+            return web.Response(status=400)
+        except Exception:
+            return web.Response(status=503)
+        return web.Response(text='ok', status=200 if accepted else 503)
+    server.router.add_get('/', health)
+    server.router.add_get('/healthz', health)
+    server.router.add_post('/webhook', webhook)
+    return server
+
+
+async def poll(app, store):
+    offset = None
+    while True:
+        try:
+            updates = await app.bot.get_updates(offset=offset, timeout=25, allowed_updates=['message','callback_query'])
+            for update in updates:
+                while not await store.enqueue(update.to_dict()):
+                    await asyncio.sleep(1)
+                offset = update.update_id+1
+        except asyncio.CancelledError:
+            raise
+        except TelegramError:
+            LOG.error('polling_unavailable; details suppressed')
+            await asyncio.sleep(5)
+
+
+async def run(cfg):
+    cfg.validate()
+    store = await Store.open(cfg)
+    tasks, runner, app = [], None, None
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(
-                "https://api.tavily.com/search",
-                headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
-                json={"query": query, "max_results": 3}
-            )
-            if resp.status_code == 200:
-                results = resp.json().get("results", [])
-                return "\n".join([f"{r.get('title')}: {r.get('content')[:300]}" for r in results])
-    except Exception as e:
-        logging.warning(f"Search error: {e}")
-    return ""
+        async with httpx.AsyncClient(timeout=httpx.Timeout(55, connect=10), limits=httpx.Limits(max_connections=8), follow_redirects=False) as client:
+            llm = LLM(cfg, store, client)
+            await llm.verify_models()
+            service = Service(cfg, store, llm, Tools(cfg, client))
+            app = make_application(cfg, service)
+            await app.initialize()
+            await app.start()
+            runner = web.AppRunner(make_web_app(service))
+            await runner.setup()
+            await web.TCPSite(runner, '0.0.0.0', cfg.port).start()
+            if cfg.webhook_url:
+                await app.bot.set_webhook(cfg.webhook_url, secret_token=cfg.webhook_secret, allowed_updates=['message','callback_query'],
+                                          max_connections=1, drop_pending_updates=False)
+            else:
+                await app.bot.delete_webhook(drop_pending_updates=False)
+                tasks.append(asyncio.create_task(poll(app, store)))
+            await store.prune()
+            async def maintenance():
+                while True:
+                    await asyncio.sleep(3600)
+                    await store.prune()
+            tasks.append(asyncio.create_task(maintenance()))
+            tasks.extend(asyncio.create_task(service.worker(app)) for _ in range(cfg.workers))
+            service.ready = True
+            LOG.info('ready mode=%s workers=%s', 'webhook' if cfg.webhook_url else 'polling', cfg.workers)
+            stop = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                with contextlib.suppress(NotImplementedError):
+                    loop.add_signal_handler(sig, stop.set)
+            await stop.wait()
+            service.ready = False
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if runner:
+            await runner.cleanup()
+        if app:
+            if app.running:
+                await app.stop()
+            await app.shutdown()
+        await store.close()
 
-def md_to_html(text):
-    t = html.escape(text or "", quote=False)
-    t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
-    return t
-
-async def do_chat(msg, text):
-    chat_id = msg.chat_id
-    await msg.chat.send_action(ChatAction.TYPING)
-    
-    # Простейшая логика: если в тексте есть "погода", ищем в интернете
-    if "погод" in text.lower():
-        web_data = await search_web(f"погода {text}")
-        if web_data:
-            text = f"Вопрос: {text}\n\nДанные из интернета: {web_data}"
-    
-    history = [{"role": "user", "content": text}]
-    answer = await ask_ai(history)
-    
-    await msg.reply_text(md_to_html(answer), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 <b>Привет! Я твой карманный всезнайка.</b>\n\n"
-        "Просто напиши мне любой вопрос, и я отвечу!\n"
-        "Умею искать информацию в интернете и общаться на любые темы.",
-        parse_mode=ParseMode.HTML
-    )
-
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg or not msg.text: return
-    if ALLOWED_USER_IDS and update.effective_user.id not in ALLOWED_USER_IDS:
-        await msg.reply_text("Извините, этот бот закрытый."); return
-
-    try:
-        await do_chat(msg, msg.text.strip())
-    except Exception as e:
-        logging.error(f"Handler error: {e}")
-        await msg.reply_text("😔 Произошла ошибка при обработке запроса.")
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).concurrent_updates(True).build()
-    app.add_handler(CommandHandler(["start", "help"], start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    load_dotenv()
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
+    for name in ('httpx','httpcore','telegram','asyncpg'):
+        logging.getLogger(name).setLevel(logging.CRITICAL)
+    try:
+        asyncio.run(run(Config.load()))
+    except (ValueError, UserError) as exc:
+        LOG.error('%s', exc)
+        raise SystemExit(1) from None
+    except Exception:
+        LOG.error('startup_failed: проверьте Environment, базу и сетевой доступ. Секреты и детали подключения скрыты.')
+        raise SystemExit(1) from None
 
-    if WEBHOOK_URL:
-        from aiohttp import web
-        async def handler(request):
-            data = await request.json()
-            update = Update.de_json(data, app.bot)
-            await app.update_queue.put(update)
-            return web.Response(text="ok")
-        async def run():
-            await app.initialize()
-            await app.bot.set_webhook(WEBHOOK_URL, allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-            await app.start()
-            server = web.Application()
-            server.router.add_post("/webhook", handler)
-            runner = web.AppRunner(server)
-            await runner.setup()
-            site = web.TCPSite(runner, "0.0.0.0", PORT)
-            await site.start()
-            logging.info("Webhook на порту %s", PORT)
-            await asyncio.Event().wait()
-        asyncio.run(run())
-    else:
-        app.run_polling()
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
