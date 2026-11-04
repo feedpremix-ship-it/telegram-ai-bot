@@ -293,7 +293,7 @@ async def run(cfg):
     store = await Store.open(cfg)
     tasks, runner, app = [], None, None
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(55, connect=10), limits=httpx.Limits(max_connections=8), follow_redirects=False) as client:
+        async with httpx.AsyncClient(headers={'User-Agent':'telegram-assistant/1.0'}, timeout=httpx.Timeout(55, connect=10), limits=httpx.Limits(max_connections=8), follow_redirects=False) as client:
             llm = LLM(cfg, store, client)
             await llm.verify_models()
             service = Service(cfg, store, llm, Tools(cfg, client))

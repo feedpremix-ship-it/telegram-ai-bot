@@ -347,3 +347,19 @@ async def test_worker_retries_terminal_write_after_db_outage():
     finally:
         task.cancel()
         await asyncio.gather(task,return_exceptions=True)
+
+async def test_neon_libpq_option_not_sent_as_server_setting(monkeypatch):
+    from assistant.store import Store
+    import asyncpg
+    seen={}
+    async def connect(dsn,**kwargs):
+        seen['dsn']=dsn;seen['ssl']=kwargs['ssl']
+        raise RuntimeError('test stop before connection')
+    monkeypatch.setattr(asyncpg,'create_pool',connect)
+    cfg=config();cfg.database_url='postgresql://u:p@db.example/neondb?sslmode=require&channel_binding=require'
+    with pytest.raises(RuntimeError,match='test stop'):
+        await Store.open(cfg)
+    assert 'channel_binding' not in seen['dsn'] and 'sslmode' not in seen['dsn']
+    assert seen['ssl'].check_hostname is True
+    import ssl
+    assert seen['ssl'].verify_mode == ssl.CERT_REQUIRED

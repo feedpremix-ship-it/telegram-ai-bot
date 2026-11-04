@@ -15,7 +15,7 @@ async def check():
     query = dict(parse_qsl(parsed.query))
     if external and query.get('sslmode') not in ('require','verify-full'):
         raise ValueError('External TLS required')
-    dsn = urlunparse(parsed._replace(query=urlencode([(k,v) for k,v in query.items() if k not in ('sslmode','sslrootcert')]))) if external else raw
+    dsn = urlunparse(parsed._replace(query=urlencode([(k,v) for k,v in query.items() if k not in ('sslmode','sslrootcert','channel_binding')]))) if external else raw
     conn = await asyncpg.connect(dsn, ssl=ssl.create_default_context() if external else None, timeout=15)
     try:
         async with conn.transaction(readonly=True):

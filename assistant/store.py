@@ -39,7 +39,7 @@ class Store:
     async def open(cls, cfg):
         parsed = urlparse(cfg.database_url)
         external = parsed.hostname not in ('localhost', '127.0.0.1')
-        dsn = urlunparse(parsed._replace(query=urlencode([(k,v) for k,v in parse_qsl(parsed.query) if k not in ('sslmode','sslrootcert')]))) if external else cfg.database_url
+        dsn = urlunparse(parsed._replace(query=urlencode([(k,v) for k,v in parse_qsl(parsed.query) if k not in ('sslmode','sslrootcert','channel_binding')]))) if external else cfg.database_url
         pool = await asyncpg.create_pool(dsn, ssl=ssl.create_default_context() if external else None, min_size=1, max_size=cfg.workers + 3,
                                         statement_cache_size=0, command_timeout=15)
         obj = cls(pool, cfg)
