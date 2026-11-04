@@ -215,7 +215,6 @@ TRANSLATE_RE = re.compile(r"перевед|перевод|translate|по-анг�
 
 async def do_weather(msg, text):
     chat_id = msg.chat_id
-    # Ищем ЛЮБЫЕ русские буквы в тексте, если нашли - берем слово после "в" или просто все слова, которые не "погода" и т.д.
     words = re.findall(r"[A-Za-zА-Яа-яЁё\-]{3,}", text.lower())
     stop_words = {"погода", "погоду", "какая", "сегодня", "завтра", "прогноз", "скажи", "покажи"}
     city = [w.capitalize() for w in words if w not in stop_words]
@@ -224,7 +223,6 @@ async def do_weather(msg, text):
         await msg.reply_text("🌍 Для какого города показать погоду?")
         return
 
-    # Пытаемся искать каждый вариант (на случай, если город из двух слов)
     for c in city:
         try:
             import httpx
